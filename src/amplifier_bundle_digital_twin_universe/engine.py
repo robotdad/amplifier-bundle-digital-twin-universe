@@ -783,6 +783,8 @@ def _start_mock_container(
 
 def _stop_mock_containers(env_id: str) -> None:
     """Stop and remove all Docker mock containers for *env_id*."""
+    if shutil.which("docker") is None:
+        return  # No Docker runtime present (Incus-only host); nothing to clean.
     result = subprocess.run(
         [
             "docker",
