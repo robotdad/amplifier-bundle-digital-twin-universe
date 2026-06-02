@@ -5,10 +5,34 @@
 All functions invoke ``incus`` as a child process, parse its output, and raise
 :class:`IncusError` on failure.  Same pattern amplifier-bundle-gitea uses for
 Docker.
+
+Exception — container creation (``create_container``):
+    The ``incus launch`` and ``incus create`` CLI commands hang indefinitely
+    when invoked from inside an Incus container via a mounted Unix socket.
+    The CLI subscribes to ``/1.0/events`` via WebSocket to wait for async
+    operation completion; that WebSocket upgrade fails silently in a nested
+    socket-mount context, so the process waits forever.
+
+    The Incus REST API's plain HTTP long-poll endpoint
+    ``/1.0/operations/{id}/wait`` works correctly through the same socket,
+    so ``create_container()`` bypasses the CLI for the create and start steps
+    and calls the REST API directly when running inside a nested Incus context.
+    All other operations (exec, list, stop, delete, config device add, etc.)
+    continue to use the CLI without issues.
+
+    Nested-context detection uses two signals (either is sufficient):
+    (1) ``/dev/incus/sock`` present (guest agent socket, exists inside ALL
+        Incus containers, never on the host) — reliable "we are nested" indicator.
+    (2) ``INCUS_SOCKET`` environment variable explicitly set to a valid socket
+        (operator-configured nested socket forwarding with a non-default path).
+    The default daemon socket at ``/var/lib/incus/unix.socket`` exists on any
+    Incus host and is intentionally *not* used as a detection signal to avoid
+    triggering the REST path on the host itself.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -21,6 +45,210 @@ import tempfile
 
 class IncusError(Exception):
     """Raised when an Incus command fails."""
+
+
+# ---------------------------------------------------------------------------
+# REST API helpers for nested-Incus container creation
+#
+# ``incus launch`` and ``incus create`` CLI commands hang indefinitely inside
+# a container that has the host daemon socket bind-mounted: the CLI subscribes
+# to ``/1.0/events`` via WebSocket to wait for the async operation to finish,
+# and that WebSocket upgrade silently fails through a mounted socket.
+#
+# The REST API's plain HTTP long-poll ``/1.0/operations/{id}/wait`` works
+# correctly through the same socket.  ``create_container()`` uses the helpers
+# below when ``_should_use_rest_create()`` returns True.
+# ---------------------------------------------------------------------------
+
+#: Guest agent socket path.  Present inside every Incus container; absent on
+#: the host.  Module-level constant so tests can monkeypatch it.
+_GUEST_AGENT_SOCKET = "/dev/incus/sock"
+
+#: Default path of the Incus daemon socket.  Exists on any host running Incus.
+_DEFAULT_INCUS_SOCKET = "/var/lib/incus/unix.socket"
+
+
+class _IncusUnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection over a Unix domain socket for Incus REST API calls.
+
+    The Incus REST API accepts requests via a Unix socket (path from
+    ``INCUS_SOCKET`` env var or default ``/var/lib/incus/unix.socket``).
+    Standard ``http.client.HTTPConnection`` targets TCP; this subclass
+    overrides ``connect()`` to open an ``AF_UNIX`` socket instead.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        super().__init__("localhost")
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self._socket_path)
+
+
+def _incus_socket_path() -> str:
+    """Return the Incus Unix socket path, respecting the ``INCUS_SOCKET`` env var."""
+    return os.environ.get("INCUS_SOCKET", _DEFAULT_INCUS_SOCKET)
+
+
+def _has_daemon_socket(socket_path: str) -> bool:
+    """Return ``True`` if *socket_path* is an existing Unix domain socket.
+
+    Used as a detection signal for explicit nested-socket forwarding when
+    ``INCUS_SOCKET`` env var is set to a non-default path.  Does *not*
+    short-circuit on the default path — callers are responsible for only
+    passing the resolved path here; ``_should_use_rest_create()`` handles
+    the host-vs-nested distinction.
+    """
+    try:
+        return stat.S_ISSOCK(os.stat(socket_path).st_mode)
+    except OSError:
+        return False
+
+
+def _has_guest_agent_socket() -> bool:
+    """Return ``True`` if the Incus guest agent socket exists.
+
+    ``/dev/incus/sock`` (``_GUEST_AGENT_SOCKET``) is present inside every
+    Incus container and is never present on the host.  Its presence is the
+    primary signal that we are running inside a nested Incus context where
+    ``incus launch`` CLI would hang.
+    """
+    try:
+        return stat.S_ISSOCK(os.stat(_GUEST_AGENT_SOCKET).st_mode)
+    except OSError:
+        return False
+
+
+def _should_use_rest_create(socket_path: str) -> bool:
+    """Return ``True`` when ``incus launch`` CLI would hang and REST must be used.
+
+    Two-signal detection (either signal is sufficient):
+
+    1. **Guest agent socket** (``/dev/incus/sock``): present inside ALL Incus
+       containers, never on the host.  Reliable primary signal for the common
+       deployment scenario where ``INCUS_SOCKET`` is not explicitly set but
+       the socket is bind-mounted at the default path.
+
+    2. **Explicit INCUS_SOCKET env var**: operator-configured nested socket
+       forwarding where INCUS_SOCKET is explicitly set to a valid socket.
+       Covers edge cases where ``/dev/incus/sock`` may be absent (e.g. custom
+       container images that strip the guest agent).
+
+    The default daemon socket (``/var/lib/incus/unix.socket``) exists on any
+    Incus host and is intentionally *not* used as a signal: it would trigger
+    the REST path on the host, where the CLI works correctly.
+    """
+    # Signal 1: guest agent socket — the most reliable nested indicator.
+    if _has_guest_agent_socket():
+        return True
+    # Signal 2: INCUS_SOCKET explicitly set (non-default path) AND valid socket.
+    if os.environ.get("INCUS_SOCKET") and _has_daemon_socket(socket_path):
+        return True
+    return False
+
+
+def _build_image_source(image: str) -> dict:
+    """Convert an image string to an Incus REST API ``source`` dict.
+
+    ``images:ubuntu/24.04``
+        Remote pull from ``https://images.linuxcontainers.org`` via the
+        ``simplestreams`` protocol.  The Incus daemon reuses a locally
+        cached image if available, so no re-download occurs for known images.
+
+    Any other string (local alias, fingerprint, ``ubuntu:24.04``, …)
+        Passed through as a local alias: ``{"type": "image", "alias": …}``.
+    """
+    if image.startswith("images:"):
+        alias = image[len("images:") :]
+        return {
+            "type": "image",
+            "mode": "pull",
+            "server": "https://images.linuxcontainers.org",
+            "protocol": "simplestreams",
+            "alias": alias,
+        }
+    return {"type": "image", "alias": image}
+
+
+def _incus_rest_request(
+    method: str,
+    path: str,
+    body: dict | None,
+    socket_path: str,
+    *,
+    op_wait_timeout: int = 60,
+) -> dict:
+    """Make a synchronous Incus REST API call over the Unix daemon socket.
+
+    For async operation responses (``type == "async"``), polls
+    ``/1.0/operations/{id}/wait`` until the operation completes or
+    *op_wait_timeout* seconds elapse.
+
+    Returns the final parsed JSON response dict.
+
+    Raises:
+        IncusError: On malformed JSON, error-type responses, or async
+            operations that report a non-empty ``err`` field.
+    """
+    conn = _IncusUnixHTTPConnection(socket_path)
+    try:
+        headers: dict[str, str] = {}
+        encoded_body: bytes | None = None
+        if body is not None:
+            encoded_body = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=encoded_body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+    finally:
+        conn.close()
+
+    try:
+        data: dict = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise IncusError(
+            f"Incus REST {method} {path}: malformed JSON response"
+        ) from exc
+
+    # Top-level error responses (e.g. 404 Not Found).
+    if data.get("type") == "error":
+        raise IncusError(
+            f"Incus REST {method} {path}: {data.get('error', 'unknown error')}"
+        )
+
+    # Async operation: poll the wait endpoint until the operation completes.
+    if data.get("type") == "async":
+        op_id = (data.get("metadata") or {}).get("id", "")
+        if not op_id:
+            raise IncusError(
+                f"Incus REST {method} {path}: async response missing operation id"
+            )
+        wait_conn = _IncusUnixHTTPConnection(socket_path)
+        try:
+            wait_conn.request(
+                "GET",
+                f"/1.0/operations/{op_id}/wait?timeout={op_wait_timeout}",
+            )
+            wait_resp = wait_conn.getresponse()
+            wait_raw = wait_resp.read()
+        finally:
+            wait_conn.close()
+
+        try:
+            data = json.loads(wait_raw)
+        except json.JSONDecodeError as exc:
+            raise IncusError(f"Incus REST wait for op {op_id}: malformed JSON") from exc
+
+    # Operation-level error (reported inside the metadata after waiting).
+    op_meta: dict = data.get("metadata") or {}
+    op_err: str = op_meta.get("err", "") if isinstance(op_meta, dict) else ""
+    if op_err:
+        raise IncusError(
+            f"Failed to create container (Incus REST {method} {path}): {op_err}"
+        )
+
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +411,42 @@ def create_container(
     image: str,
     config: dict[str, str] | None = None,
 ) -> None:
-    """``incus launch <image> <name> [--config k=v ...]``"""
+    """Create and start an Incus container from *image* with the given *name*.
+
+    On the host (non-nested context) the function delegates to ``incus launch``
+    via a subprocess call, preserving the configurable timeout from
+    ``AMPLIFIER_DTU_INCUS_LAUNCH_TIMEOUT_SECONDS``.
+
+    When running inside an Incus container (nested context, detected via
+    ``_should_use_rest_create()``), the function uses the Incus REST API
+    directly — first ``POST /1.0/instances`` to create the instance, then
+    ``PUT /1.0/instances/{name}/state`` with ``action=start``.  This avoids
+    the ``incus launch`` CLI hang caused by a failed WebSocket event subscription
+    through a bind-mounted Unix socket (see module docstring for details).
+    """
+    socket_path = _incus_socket_path()
+    if _should_use_rest_create(socket_path):
+        # --- REST path (nested Incus container) ---
+        instance_config: dict[str, str] = dict(config) if config else {}
+        create_body: dict = {
+            "name": name,
+            "source": _build_image_source(image),
+            "config": instance_config,
+        }
+        _incus_rest_request(
+            "POST", "/1.0/instances", create_body, socket_path, op_wait_timeout=120
+        )
+        start_body: dict = {"action": "start", "timeout": 30}
+        _incus_rest_request(
+            "PUT",
+            f"/1.0/instances/{name}/state",
+            start_body,
+            socket_path,
+            op_wait_timeout=60,
+        )
+        return
+
+    # --- CLI path (host-level usage) ---
     cmd = ["incus", "launch", image, name]
     if config:
         for k, v in config.items():
