@@ -31,6 +31,7 @@ def check_incus() -> None:
             capture_output=True,
             text=True,
             timeout=10,
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             raise IncusError(f"Incus daemon unreachable: {result.stderr.strip()}")
@@ -133,7 +134,9 @@ def create_container(
     if config:
         for k, v in config.items():
             cmd.extend(["--config", f"{k}={v}"])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0:
         raise IncusError(f"Failed to create container {name}: {result.stderr.strip()}")
 
@@ -145,6 +148,7 @@ def stop_container(name: str) -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        stdin=subprocess.DEVNULL,
     )
 
 
@@ -153,7 +157,9 @@ def delete_container(name: str, force: bool = False) -> None:
     cmd = ["incus", "delete", name]
     if force:
         cmd.append("--force")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0:
         raise IncusError(f"Failed to delete container {name}: {result.stderr.strip()}")
 
@@ -165,6 +171,7 @@ def container_exists(name: str) -> bool:
         capture_output=True,
         text=True,
         timeout=10,
+        stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
 
@@ -189,7 +196,9 @@ def exec_command(
         for k, v in env.items():
             cmd.extend(["--env", f"{k}={v}"])
     cmd.extend(["--", *command])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+    )
     return result.returncode, result.stdout, result.stderr
 
 
@@ -209,7 +218,7 @@ def exec_stream(
         for k, v in env.items():
             cmd.extend(["--env", f"{k}={v}"])
     cmd.extend(["--", *command])
-    result = subprocess.run(cmd, timeout=timeout)
+    result = subprocess.run(cmd, timeout=timeout, stdin=subprocess.DEVNULL)
     return result.returncode
 
 
@@ -282,7 +291,9 @@ def file_push(
     if gid is not None:
         cmd.extend(["--gid", str(gid)])
     cmd.extend([*local_paths, dest])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0:
         raise IncusError(f"Failed to push file: {result.stderr.strip()}")
 
@@ -304,7 +315,9 @@ def file_pull(
     if create_dirs:
         cmd.append("--create-dirs")
     cmd.extend([*srcs, local_path])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0:
         raise IncusError(f"Failed to pull file: {result.stderr.strip()}")
 
@@ -321,6 +334,7 @@ def set_config(name: str, key: str, value: str) -> None:
         capture_output=True,
         text=True,
         timeout=10,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise IncusError(
@@ -335,6 +349,7 @@ def get_config(name: str, key: str) -> str:
         capture_output=True,
         text=True,
         timeout=10,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise IncusError(
